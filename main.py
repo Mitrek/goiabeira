@@ -424,27 +424,6 @@ class AgentConfigRow(QFrame):
         self.avatar.text = f"[{tag}]"
         self.avatar.update()
 
-class DodConfigRow(QFrame):
-    removed = pyqtSignal(QWidget)
-    changed = pyqtSignal()
-    
-    def __init__(self, text="", parent=None):
-        super().__init__(parent)
-        self.setProperty("class", "ConfigRow")
-        
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 6, 12, 6)
-        
-        self.txt_rule = QLineEdit(text)
-        self.txt_rule.setPlaceholderText("Specify verification metric...")
-        self.txt_rule.textChanged.connect(lambda: self.changed.emit())
-        
-        btn_del = QPushButton("[ REMOVE ]")
-        btn_del.setProperty("class", "DestructiveBtn")
-        btn_del.clicked.connect(lambda: self.removed.emit(self))
-        
-        layout.addWidget(self.txt_rule)
-        layout.addWidget(btn_del)
 
 
 class TuiStatBox(QFrame):
@@ -479,7 +458,6 @@ class GoiabeiraApp(QMainWindow):
         
         # State Data
         self.agent_config_widgets = []
-        self.dod_config_widgets = []
         self.project_description = ""
         
         # Default state values
@@ -490,7 +468,6 @@ class GoiabeiraApp(QMainWindow):
         
         # Placeholders
         self.lbl_agent_placeholder = None
-        self.lbl_dod_placeholder = None
         
         # Simulation State
         self.simulation_timer = QTimer(self)
@@ -512,8 +489,14 @@ class GoiabeiraApp(QMainWindow):
         # Build UI from selected project
         self.load_project_to_ui(self.active_project_name)
         
-        # Connect text changed signal to save when description is edited
+        # Connect text changed signals to save configuration
         self.txt_project_desc.textChanged.connect(self.on_project_desc_changed)
+        self.txt_dod_rules.textChanged.connect(self.on_dod_text_changed)
+        
+        # Sync vertical scroll bars of DoD rules editor and line numbers
+        self.txt_dod_rules.verticalScrollBar().valueChanged.connect(
+            self.txt_dod_numbers.verticalScrollBar().setValue
+        )
         
         self.sync_monitor_tab()
         self.switch_tab(0)
@@ -820,13 +803,34 @@ class GoiabeiraApp(QMainWindow):
         title_dod.setProperty("class", "SectionTitle")
         dod_layout.addWidget(title_dod)
         
-        self.dod_list_layout = QVBoxLayout()
-        dod_layout.addLayout(self.dod_list_layout)
+        desc_dod = QLabel("Specify one verification rule per line. The daemon validates each entry dynamically.")
+        desc_dod.setStyleSheet("color: #8EAE91; font-size: 11px; padding-bottom: 8px;")
+        desc_dod.setWordWrap(True)
+        dod_layout.addWidget(desc_dod)
         
-        btn_add_dod = QPushButton("[ + ADD NEW DoD CHECK ]")
-        btn_add_dod.setProperty("class", "PrimaryBtn")
-        btn_add_dod.clicked.connect(lambda: self.add_dod_row())
-        dod_layout.addWidget(btn_add_dod)
+        dod_edit_layout = QHBoxLayout()
+        dod_edit_layout.setSpacing(5)
+        
+        self.txt_dod_numbers = QTextEdit("1")
+        self.txt_dod_numbers.setReadOnly(True)
+        self.txt_dod_numbers.setFixedWidth(30)
+        self.txt_dod_numbers.setFrameStyle(QFrame.Shape.NoFrame)
+        self.txt_dod_numbers.setStyleSheet(
+            "background-color: transparent; color: #3A6B3E; "
+            "font-family: 'Courier New', 'Consolas', monospace; font-size: 12px; "
+            "padding: 10px 0px 10px 0px; text-align: right;"
+        )
+        self.txt_dod_numbers.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.txt_dod_numbers.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        self.txt_dod_rules = QTextEdit()
+        self.txt_dod_rules.setObjectName("ProjectDescInput")
+        self.txt_dod_rules.setMinimumHeight(150)
+        self.txt_dod_rules.setPlaceholderText("Enter system verification metrics...")
+        
+        dod_edit_layout.addWidget(self.txt_dod_numbers)
+        dod_edit_layout.addWidget(self.txt_dod_rules)
+        dod_layout.addLayout(dod_edit_layout)
         
         self.scroll_layout.addWidget(self.dod_section)
         
@@ -893,25 +897,6 @@ class GoiabeiraApp(QMainWindow):
         if not getattr(self, "loading_project", False):
             self.save_config_to_file()
 
-    def add_dod_row(self, rule=""):
-        if isinstance(rule, bool):
-            rule = ""
-        row = DodConfigRow(rule)
-        row.removed.connect(self.remove_dod_row)
-        row.changed.connect(self.save_config_to_file)
-        self.dod_list_layout.addWidget(row)
-        self.dod_config_widgets.append(row)
-        self.sync_placeholders()
-        if not getattr(self, "loading_project", False):
-            self.save_config_to_file()
-
-    def remove_dod_row(self, widget):
-        widget.setParent(None)
-        if widget in self.dod_config_widgets:
-            self.dod_config_widgets.remove(widget)
-        self.sync_placeholders()
-        if not getattr(self, "loading_project", False):
-            self.save_config_to_file()
 
     def sync_agent_roles(self):
         for idx, row in enumerate(self.agent_config_widgets):
@@ -943,17 +928,6 @@ class GoiabeiraApp(QMainWindow):
             if hasattr(self, "lbl_agent_placeholder") and self.lbl_agent_placeholder is not None:
                 self.lbl_agent_placeholder.setParent(None)
                 self.lbl_agent_placeholder = None
-
-        # 2. DoD Placeholder
-        if len(self.dod_config_widgets) == 0:
-            if not hasattr(self, "lbl_dod_placeholder") or self.lbl_dod_placeholder is None:
-                self.lbl_dod_placeholder = QLabel(" -[ No validation rules defined. Rules adder below. ]-")
-                self.lbl_dod_placeholder.setStyleSheet("color: #3A6B3E; font-style: italic; padding: 10px;")
-                self.dod_list_layout.addWidget(self.lbl_dod_placeholder)
-        else:
-            if hasattr(self, "lbl_dod_placeholder") and self.lbl_dod_placeholder is not None:
-                self.lbl_dod_placeholder.setParent(None)
-                self.lbl_dod_placeholder = None
 
     # ---------------------------------------------------------
     # Sync Configuration from GUI inputs to Model State variables
@@ -988,8 +962,9 @@ class GoiabeiraApp(QMainWindow):
         
         # 2. Read DoD Checklist Rules
         self.dod_list = []
-        for w in self.dod_config_widgets:
-            rule = w.txt_rule.text().strip()
+        dod_text = self.txt_dod_rules.toPlainText()
+        for line in dod_text.split("\n"):
+            rule = line.strip()
             if rule:
                 self.dod_list.append({"text": rule, "checked": False})
                 
@@ -1003,6 +978,18 @@ class GoiabeiraApp(QMainWindow):
         if not getattr(self, "loading_project", False):
             self.project_description = self.txt_project_desc.toPlainText().strip()
             self.save_config_to_file()
+
+    def on_dod_text_changed(self):
+        if getattr(self, "loading_project", False):
+            return
+            
+        text = self.txt_dod_rules.toPlainText()
+        lines = text.split("\n")
+        num_lines = len(lines)
+        numbers_str = "\n".join(str(i + 1) for i in range(num_lines))
+        self.txt_dod_numbers.setPlainText(numbers_str)
+        
+        self.save_config_to_file()
 
     def load_projects_from_file(self):
         import os
@@ -1080,11 +1067,6 @@ class GoiabeiraApp(QMainWindow):
             w.setParent(None)
         self.agent_config_widgets.clear()
         
-        # Clear existing DoD config widgets from layout and list
-        for w in list(self.dod_config_widgets):
-            w.setParent(None)
-        self.dod_config_widgets.clear()
-        
         # Set description
         self.txt_project_desc.setPlainText(proj.get("description", ""))
         
@@ -1097,9 +1079,9 @@ class GoiabeiraApp(QMainWindow):
                 desc=ag.get("desc", "")
             )
             
-        # Add DoD rows
-        for rule in proj.get("dod", []):
-            self.add_dod_row(rule=rule.get("text", ""))
+        # Set DoD checks multiline text
+        dod_rules = [item.get("text", "") for item in proj.get("dod", [])]
+        self.txt_dod_rules.setPlainText("\n".join(dod_rules))
             
         self.sync_agent_roles()
         self.sync_placeholders()
