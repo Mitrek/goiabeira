@@ -1,12 +1,19 @@
 import sys
+import json
 import random
+from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTextEdit, QFrame, QStackedWidget,
     QProgressBar, QSplitter, QScrollArea, QLineEdit, QComboBox, QDialog
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QProcess, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QPainter, QPixmap, QIcon, QPen, QBrush
+
+PROJECT_ROOT = Path(__file__).parent
+PROJECTS_JSON = PROJECT_ROOT / "projects.json"
+PYTHON_BIN = PROJECT_ROOT / ".venv" / "bin" / "python3"
+RUN_SCRIPT  = PROJECT_ROOT / "run.py"
 
 # ---------------------------------------------------------
 # QSS Stylesheet matching Guava Skin CLI / TUI Theme
@@ -39,10 +46,10 @@ QLabel#SidebarLogo {
 }
 
 QLabel#SidebarSubtitle {
-    font-size: 11px;
-    color: #FFA39E;
+    font-size: 20px;
+    color: #FFFFFF;
     font-weight: bold;
-    padding: 10px 10px 20px 20px;
+    padding: 5px 10px 20px 25px;
 }
 
 /* Sidebar Buttons */
@@ -371,8 +378,10 @@ class AgentConfigRow(QFrame):
     name_changed = pyqtSignal()
     changed = pyqtSignal()
     
-    def __init__(self, name="", source="Codex", role="", desc="", parent=None):
+    def __init__(self, name="", source="Codex", role="", desc="", session_id=None, parent=None):
         super().__init__(parent)
+        import uuid
+        self.session_id = session_id or str(uuid.uuid4())
         self.setProperty("class", "ConfigRow")
         
         layout = QHBoxLayout(self)
@@ -469,9 +478,13 @@ class GoiabeiraApp(QMainWindow):
         # Placeholders
         self.lbl_agent_placeholder = None
         
-        # Simulation State
-        self.simulation_timer = QTimer(self)
-        self.simulation_timer.timeout.connect(self.run_simulation_step)
+        # Bridge process + live-tail state
+        self._process: QProcess | None = None
+        self._log_file_offset = 0
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll_run_state)
+
+        # Legacy sim state (kept so sim_cost refs elsewhere don't crash)
         self.sim_step = 0
         self.sim_cost = 0.0
         self.sim_tokens = 0
@@ -518,7 +531,7 @@ class GoiabeiraApp(QMainWindow):
         # Title/Logo ASCII Tree
         logo_lbl = QLabel(TREE_ASCII)
         logo_lbl.setObjectName("SidebarLogo")
-        subtitle_lbl = QLabel("🌸 GOIABEIRA")
+        subtitle_lbl = QLabel("GOIABEIRA")
         subtitle_lbl.setObjectName("SidebarSubtitle")
         sidebar_layout.addWidget(logo_lbl)
         sidebar_layout.addWidget(subtitle_lbl)
@@ -633,12 +646,10 @@ class GoiabeiraApp(QMainWindow):
         self.stat_agents = TuiStatBox("ACTIVE AGENTS", "0")
         self.stat_tasks = TuiStatBox("PROJECT DESCRIPTION", "EMPTY")
         self.stat_dod = TuiStatBox("DoD VERIFIED RATE", "0%")
-        self.stat_cost = TuiStatBox("ACCUMULATED API COST", "$0.0000")
         
         stats_layout.addWidget(self.stat_agents)
         stats_layout.addWidget(self.stat_tasks)
         stats_layout.addWidget(self.stat_dod)
-        stats_layout.addWidget(self.stat_cost)
         
         layout.addLayout(stats_layout)
         
@@ -694,10 +705,6 @@ class GoiabeiraApp(QMainWindow):
         # Control Buttons toolbar
         ctrls = QHBoxLayout()
         
-        self.btn_run = QPushButton("[ EXECUTE THREAD DAEMON ]")
-        self.btn_run.setProperty("class", "PrimaryBtn")
-        self.btn_run.clicked.connect(self.start_orchestration_run)
-        
         self.btn_stop = QPushButton("[ SIGINT STOP ]")
         self.btn_stop.setProperty("class", "SecondaryBtn")
         self.btn_stop.setEnabled(False)
@@ -707,7 +714,6 @@ class GoiabeiraApp(QMainWindow):
         self.btn_clear.setProperty("class", "SecondaryBtn")
         self.btn_clear.clicked.connect(self.clear_console_logs)
         
-        ctrls.addWidget(self.btn_run)
         ctrls.addWidget(self.btn_stop)
         ctrls.addWidget(self.btn_clear)
         ctrls.addStretch()
@@ -732,7 +738,6 @@ class GoiabeiraApp(QMainWindow):
         self.stat_agents.update_value(len(self.agent_roles))
         desc_status = "LOADED" if self.project_description.strip() else "EMPTY"
         self.stat_tasks.update_value(desc_status)
-        self.stat_cost.update_value(f"${self.sim_cost:.4f}")
         
         checked_dod = sum(1 for d in self.dod_list if d["checked"])
         total_dod = len(self.dod_list)
@@ -851,6 +856,11 @@ class GoiabeiraApp(QMainWindow):
         
         self.scroll_layout.addWidget(self.tasks_section)
         
+        self.btn_run = QPushButton("[ RUN PROJECT ]")
+        self.btn_run.setProperty("class", "PrimaryBtn")
+        self.btn_run.clicked.connect(self.run_project_from_config)
+        self.scroll_layout.addWidget(self.btn_run)
+        
         scroll.setWidget(container)
         layout.addWidget(scroll)
         return widget
@@ -868,7 +878,7 @@ class GoiabeiraApp(QMainWindow):
             desc = dialog.txt_desc.text().strip()
             self.add_agent_row(name, source, role, desc)
 
-    def add_agent_row(self, name="", source="Codex", role="", desc=""):
+    def add_agent_row(self, name="", source="Codex", role="", desc="", session_id=None):
         if isinstance(name, bool):
             name = ""
         if not name:
@@ -878,7 +888,7 @@ class GoiabeiraApp(QMainWindow):
             role = "Orchestrator"
         elif not role:
             role = "Worker"
-        row = AgentConfigRow(name, source, role, desc)
+        row = AgentConfigRow(name, source, role, desc, session_id=session_id)
         row.removed.connect(self.remove_agent_row)
         row.changed.connect(self.save_config_to_file)
         self.agents_list_layout.addWidget(row)
@@ -955,7 +965,8 @@ class GoiabeiraApp(QMainWindow):
                 "name": name,
                 "source": source,
                 "role": role,
-                "desc": desc
+                "desc": desc,
+                "session_id": getattr(w, "session_id", None)
             })
             
         self.num_agents = len(self.agent_roles)
@@ -1000,7 +1011,24 @@ class GoiabeiraApp(QMainWindow):
             try:
                 with open(self.config_filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                self.active_project_name = data.get("active_project", "Default Project")
+                
+                project_arg = None
+                for arg in sys.argv[1:]:
+                    if arg.startswith("-p=") or arg.startswith("--project="):
+                        project_arg = arg.split("=", 1)[1]
+                        break
+                if not project_arg:
+                    for i in range(len(sys.argv) - 1):
+                        if sys.argv[i] in ("-p", "--project"):
+                            val = sys.argv[i + 1]
+                            if not val.startswith("-"):
+                                project_arg = val
+                                break
+                
+                if project_arg:
+                    self.active_project_name = project_arg
+                else:
+                    self.active_project_name = data.get("active_project", "Default Project")
                 self.projects_dict = data.get("projects", {})
             except Exception as e:
                 print(f"Error reading projects.json: {e}")
@@ -1076,7 +1104,8 @@ class GoiabeiraApp(QMainWindow):
                 name=ag.get("name", ""),
                 source=ag.get("source", "Codex"),
                 role=ag.get("role", ""),
-                desc=ag.get("desc", "")
+                desc=ag.get("desc", ""),
+                session_id=ag.get("session_id", None)
             )
             
         # Set DoD checks multiline text
@@ -1170,38 +1199,47 @@ class GoiabeiraApp(QMainWindow):
         self.txt_console.clear()
         self.txt_console.append("goiabeira@os-tty:~$ tty_cleared")
 
+    def _log_path(self) -> Path:
+        slug = self.active_project_name.lower().replace(" ", "_")
+        return PROJECT_ROOT / f"{slug}.log"
+
+    def run_project_from_config(self):
+        self.switch_tab(1)
+        self.start_orchestration_run()
+
     def start_orchestration_run(self):
         self.read_config_from_ui()
         if not self.agents_data:
             self.txt_console.append("\n[ERROR] Thread orchestration aborting. Agent roster is empty.")
             return
-            
+
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        
-        self.sim_step = 0
-        self.sim_cost = 0.0
-        self.sim_tokens = 0
-        
         self.lbl_status_val.setText("[RUNNING]")
         self.lbl_status_val.setStyleSheet("color: #7CD982; font-weight: bold;")
-        
-        # Reset DoD checklist validations
-        for d in self.dod_list:
-            d["checked"] = False
-            
         self.progress_bar.setValue(0)
-        self.sync_monitor_tab()
-        
-        self.txt_console.append("\n" + "="*70)
-        self.txt_console.append("[SYSTEM] INITIALIZING GOIABEIRA THREAD PIPELINE RUN...")
-        self.txt_console.append(f"[SYSTEM] Daemon loaded with {self.num_agents} active agent processes.")
-        self.txt_console.append("="*70)
-        
-        self.simulation_timer.start(1200)
+
+        # record where the log file ends NOW so we only tail new lines
+        log = self._log_path()
+        self._log_file_offset = log.stat().st_size if log.exists() else 0
+
+        self.txt_console.append("\n" + "=" * 70)
+        self.txt_console.append(f"[SYSTEM] Launching run.py for project: {self.active_project_name}")
+        self.txt_console.append("=" * 70)
+
+        self._process = QProcess(self)
+        self._process.finished.connect(self._on_process_finished)
+        self._process.start(str(PYTHON_BIN), [str(RUN_SCRIPT)])
+
+        self._poll_timer.start(500)
 
     def stop_orchestration_run(self):
-        self.simulation_timer.stop()
+        self._poll_timer.stop()
+        if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
+            self._process.terminate()
+            self._process.waitForFinished(3000)
+            if self._process.state() != QProcess.ProcessState.NotRunning:
+                self._process.kill()
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.lbl_status_val.setText("[ABORTED]")
@@ -1209,95 +1247,61 @@ class GoiabeiraApp(QMainWindow):
         self.rebuild_roster_status_text("HALTED")
         self.txt_console.append("\n[WARN] SIGINT received. Halting threads.")
 
-    def run_simulation_step(self):
-        self.sim_step += 1
-        
-        tokens_gained = random.randint(1200, 2800)
-        cost_gained = tokens_gained * 0.00001
-        self.sim_tokens += tokens_gained
-        self.sim_cost += cost_gained
-        
-        self.lbl_tokens.setText(f"{self.sim_tokens:,} tkn")
-        self.progress_bar.setValue(int(self.sim_step * 12.5))
-        
-        agent_names = [item["name"] for item in self.agents_data]
-        agent_sources = [item["source"] for item in self.agents_data]
-        agent_roles = [item["role"] for item in self.agents_data]
-        
-        if self.sim_step == 1:
-            self.txt_console.append("15:47:01 [DAEMON] Instantiating IPC memory bridge...")
-            self.rebuild_roster_status_text("STANDBY", active_idx=0, detail="IPC init")
-            self.sync_monitor_tab()
-                
-        elif self.sim_step == 2:
-            name = agent_names[0] if len(agent_names) > 0 else "Goiabeira-1"
-            role = agent_roles[0] if len(agent_roles) > 0 else "Architect"
-            src = agent_sources[0] if len(agent_sources) > 0 else "Claude"
-            self.txt_console.append(f"15:47:03 [{name}] ({src.upper()} Thread) Scanning DoD validation arrays.")
-            self.txt_console.append(f"15:47:04 [{name}] Validated {len(self.dod_list)} rules successfully.")
-            self.rebuild_roster_status_text("STANDBY", active_idx=0, detail="DoD checks")
-            self.sync_monitor_tab()
-            
-        elif self.sim_step == 3:
-            name = agent_names[1] if len(agent_names) > 1 else (agent_names[0] if len(agent_names) > 0 else "Goiabeira-2")
-            role = agent_roles[1] if len(agent_roles) > 1 else "Developer"
-            src = agent_sources[1] if len(agent_sources) > 1 else "Codex"
-            self.txt_console.append(f"15:47:05 [{name}] ({src.upper()} Thread) Starting compilation segment logic.")
-            self.txt_console.append(f"15:47:06 [{name}] Code writes successfully modified (/src/engine.py).")
-            self.rebuild_roster_status_text("STANDBY", active_idx=min(1, len(agent_names)-1), detail="Writing patch")
-            self.sync_monitor_tab()
-            
-        elif self.sim_step == 4:
-            name = agent_names[1] if len(agent_names) > 1 else (agent_names[0] if len(agent_names) > 0 else "Goiabeira-2")
-            name_tst = agent_names[2] if len(agent_names) > 2 else (agent_names[0] if len(agent_names) > 0 else "Goiabeira-3")
-            src_tst = agent_sources[2] if len(agent_sources) > 2 else "Antigravity"
-            self.txt_console.append(f"15:47:07 [{name}] Exit code 0 (clean compiled compile).")
-            self.txt_console.append(f"15:47:08 [{name_tst}] ({src_tst.upper()} Thread) Launching automated testing suite...")
-            if len(self.dod_list) > 1:
-                self.dod_list[1]["checked"] = True
-            self.rebuild_roster_status_text("STANDBY", active_idx=min(2, len(agent_names)-1), detail="Compiling test checks")
-            self.sync_monitor_tab()
-                
-        elif self.sim_step == 5:
-            name_tst = agent_names[2] if len(agent_names) > 2 else (agent_names[0] if len(agent_names) > 0 else "Goiabeira-3")
-            src_tst = agent_sources[2] if len(agent_sources) > 2 else "Antigravity"
-            self.txt_console.append(f"15:47:09 [{name_tst}] ({src_tst.upper()} Thread) unit_test_runner outputs: [PASS] 24/24 scripts verified.")
-            if len(self.dod_list) > 0:
-                self.dod_list[0]["checked"] = True
-            self.rebuild_roster_status_text("STANDBY", active_idx=min(2, len(agent_names)-1), detail="Verifying tests")
-            self.sync_monitor_tab()
-            
-        elif self.sim_step == 6:
-            name_rev = agent_names[3] if len(agent_names) > 3 else (agent_names[0] if len(agent_names) > 0 else "Goiabeira-4")
-            src_rev = agent_sources[3] if len(agent_sources) > 3 else "Claude"
-            self.txt_console.append(f"15:47:11 [{name_rev}] ({src_rev.upper()} Thread) Auditing check flags for security warnings.")
-            self.txt_console.append(f"15:47:12 [{name_rev}] Static analyzer: Zero security anomalies flagged.")
-            if len(self.dod_list) > 2:
-                self.dod_list[2]["checked"] = True
-            if len(self.dod_list) > 3:
-                self.dod_list[3]["checked"] = True
-            self.rebuild_roster_status_text("STANDBY", active_idx=min(3, len(agent_names)-1), detail="Sec audit checks")
-            self.sync_monitor_tab()
-            
-        elif self.sim_step == 7:
-            name_rev = agent_names[3] if len(agent_names) > 3 else (agent_names[0] if len(agent_names) > 0 else "Goiabeira-4")
-            src_rev = agent_sources[3] if len(agent_sources) > 3 else "Claude"
-            self.txt_console.append(f"15:47:13 [{name_rev}] ({src_rev.upper()} Thread) Patch conforms to current repository parameters. Merging branch.")
-            self.rebuild_roster_status_text("STANDBY", active_idx=min(3, len(agent_names)-1), detail="Merging patches")
-            self.sync_monitor_tab()
-            
-        elif self.sim_step == 8:
-            self.txt_console.append("="*70)
-            self.txt_console.append("[SYSTEM] GOIABEIRA THREAD PIPELINE RUN SUCCESSFUL.")
-            self.txt_console.append(f"[SYSTEM] Total elapsed execution cycle cost: ${self.sim_cost:.4f}.")
-            self.txt_console.append("="*70)
-            
-            self.simulation_timer.stop()
-            self.btn_run.setEnabled(True)
-            self.btn_stop.setEnabled(False)
-            self.lbl_status_val.setText("[DONE]")
-            self.lbl_status_val.setStyleSheet("color: #7CD982; font-weight: bold;")
-            self.rebuild_roster_status_text("STANDBY")
+    def _on_process_finished(self, exit_code, _exit_status):
+        self._poll_timer.stop()
+        self._poll_run_state()  # flush any remaining log lines
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        label = "[DONE]" if exit_code == 0 else f"[ERROR exit={exit_code}]"
+        color = "#7CD982" if exit_code == 0 else "#FFA39E"
+        self.lbl_status_val.setText(label)
+        self.lbl_status_val.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def _poll_run_state(self):
+        # --- tail the log file ---
+        log = self._log_path()
+        if log.exists():
+            size = log.stat().st_size
+            if size > self._log_file_offset:
+                with open(log, "rb") as f:
+                    f.seek(self._log_file_offset)
+                    new_bytes = f.read(size - self._log_file_offset)
+                self._log_file_offset = size
+                for line in new_bytes.decode("utf-8", errors="replace").splitlines():
+                    self.txt_console.append(line)
+                sb = self.txt_console.verticalScrollBar()
+                sb.setValue(sb.maximum())
+
+        # --- poll projects.json run_state ---
+        try:
+            data = json.loads(PROJECTS_JSON.read_text(encoding="utf-8"))
+            proj = data.get("projects", {}).get(self.active_project_name, {})
+            rs = proj.get("run_state", {})
+        except Exception:
+            return
+
+        # update roster panel
+        agents = rs.get("agents", [])
+        if agents:
+            lines = ["[DAEMON THREAD MONITOR]"]
+            for i, a in enumerate(agents):
+                status = a.get("status", "STANDBY")
+                detail = a.get("detail", "")
+                tag = f"[{status}]" + (f" ({detail})" if detail else "")
+                lines.append(f"PID {4100+i} | {a['name']:<10} ({a['role']:<12}) -> {tag:<30}")
+            self.txt_roster_status.setPlainText("\n".join(lines))
+
+        # update DoD list + progress bar
+        dod = rs.get("dod", [])
+        if dod:
+            for i, item in enumerate(dod):
+                if i < len(self.dod_list):
+                    self.dod_list[i]["checked"] = item.get("checked", False)
+            checked = sum(1 for d in self.dod_list if d["checked"])
+            total = len(self.dod_list)
+            pct = int(checked / total * 100) if total else 0
+            self.progress_bar.setValue(pct)
+            self.stat_dod.update_value(f"{pct}%")
             self.sync_monitor_tab()
 
 
