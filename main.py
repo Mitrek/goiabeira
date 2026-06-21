@@ -597,6 +597,11 @@ class GoiabeiraApp(QMainWindow):
         self.btn_new_project.clicked.connect(self.prompt_create_project)
         header_layout.addWidget(self.btn_new_project)
         
+        self.btn_run = QPushButton("[ RUN PROJECT ▶ ]")
+        self.btn_run.setProperty("class", "PrimaryBtn")
+        self.btn_run.clicked.connect(self.toggle_project_run)
+        header_layout.addWidget(self.btn_run)
+        
         right_layout.addWidget(header)
         
         # Stacked Main Area
@@ -855,11 +860,6 @@ class GoiabeiraApp(QMainWindow):
         tasks_layout.addWidget(self.txt_project_desc)
         
         self.scroll_layout.addWidget(self.tasks_section)
-        
-        self.btn_run = QPushButton("[ RUN PROJECT ]")
-        self.btn_run.setProperty("class", "PrimaryBtn")
-        self.btn_run.clicked.connect(self.run_project_from_config)
-        self.scroll_layout.addWidget(self.btn_run)
         
         scroll.setWidget(container)
         layout.addWidget(scroll)
@@ -1203,9 +1203,15 @@ class GoiabeiraApp(QMainWindow):
         slug = self.active_project_name.lower().replace(" ", "_")
         return PROJECT_ROOT / f"{slug}.log"
 
-    def run_project_from_config(self):
-        self.switch_tab(1)
-        self.start_orchestration_run()
+    def toggle_project_run(self):
+        is_running = (hasattr(self, "_process") and 
+                      self._process is not None and 
+                      self._process.state() != QProcess.ProcessState.NotRunning)
+        if is_running:
+            self.stop_orchestration_run()
+        else:
+            self.switch_tab(1)
+            self.start_orchestration_run()
 
     def start_orchestration_run(self):
         self.read_config_from_ui()
@@ -1213,8 +1219,12 @@ class GoiabeiraApp(QMainWindow):
             self.txt_console.append("\n[ERROR] Thread orchestration aborting. Agent roster is empty.")
             return
 
-        self.btn_run.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        # Change play button to stop button
+        self.btn_run.setText("[ STOP PROJECT ◼ ]")
+        self.btn_run.setProperty("class", "DestructiveBtn")
+        self.btn_run.style().unpolish(self.btn_run)
+        self.btn_run.style().polish(self.btn_run)
+        
         self.lbl_status_val.setText("[RUNNING]")
         self.lbl_status_val.setStyleSheet("color: #7CD982; font-weight: bold;")
         self.progress_bar.setValue(0)
@@ -1240,8 +1250,13 @@ class GoiabeiraApp(QMainWindow):
             self._process.waitForFinished(3000)
             if self._process.state() != QProcess.ProcessState.NotRunning:
                 self._process.kill()
-        self.btn_run.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+        
+        # Change stop button back to play button
+        self.btn_run.setText("[ RUN PROJECT ▶ ]")
+        self.btn_run.setProperty("class", "PrimaryBtn")
+        self.btn_run.style().unpolish(self.btn_run)
+        self.btn_run.style().polish(self.btn_run)
+        
         self.lbl_status_val.setText("[ABORTED]")
         self.lbl_status_val.setStyleSheet("color: #FFA39E; font-weight: bold;")
         self.rebuild_roster_status_text("HALTED")
@@ -1250,8 +1265,13 @@ class GoiabeiraApp(QMainWindow):
     def _on_process_finished(self, exit_code, _exit_status):
         self._poll_timer.stop()
         self._poll_run_state()  # flush any remaining log lines
-        self.btn_run.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+        
+        # Change stop button back to play button
+        self.btn_run.setText("[ RUN PROJECT ▶ ]")
+        self.btn_run.setProperty("class", "PrimaryBtn")
+        self.btn_run.style().unpolish(self.btn_run)
+        self.btn_run.style().polish(self.btn_run)
+        
         label = "[DONE]" if exit_code == 0 else f"[ERROR exit={exit_code}]"
         color = "#7CD982" if exit_code == 0 else "#FFA39E"
         self.lbl_status_val.setText(label)
